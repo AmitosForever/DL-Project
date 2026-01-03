@@ -1,0 +1,14 @@
+{
+  "linear_regression": {
+    "combined_test_mse_original": 1.241717452620919e+49,
+    "combined_test_r2_original": -1.9577245331306237e+40,
+    "training_mse_original": 6.848807362946913e+31,
+    "training_r2_original": -9.813030311764439e+22
+  },
+  "ridge_regression": {
+    "combined_test_mse_original": 1.223304377001822e+49,
+    "combined_test_r2_original": -1.9286939917672815e+40,
+    "training_mse_original": 6.8075556824745755e+31,
+    "training_r2_original": -9.753924547879718e+22
+  }
+}
