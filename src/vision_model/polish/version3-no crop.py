@@ -1,0 +1,1046 @@
+import os
+import re
+import math
+import time
+import argparse
+import random
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
+from torchvision import transforms
+from torchvision.models import convnext_tiny, ConvNeXt_Tiny_Weights
+
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+
+# -----------------------------
+# Repro + speed
+# -----------------------------
+def seed_all(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
+
+
+# -----------------------------
+# Column guessing
+# -----------------------------
+def guess_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    cols = [c.lower() for c in columns]
+    for cand in candidates:
+        for i, c in enumerate(cols):
+            if cand in c:
+                return columns[i]
+    return None
+
+
+# -----------------------------
+# Kaggle auto download
+# -----------------------------
+def auto_download_diamond_dataset() -> str:
+    try:
+        import kagglehub
+    except ImportError as e:
+        raise RuntimeError("kagglehub לא מותקן. התקן: pip install kagglehub") from e
+    return kagglehub.dataset_download("aayushpurswani/diamond-images-dataset")
+
+
+def find_best_csv(ds_root: str) -> str:
+    csvs = []
+    for r, _, files in os.walk(ds_root):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                csvs.append(os.path.join(r, f))
+    if not csvs:
+        raise FileNotFoundError(f"לא נמצאו CSV תחת: {ds_root}")
+
+    def score_csv(p: str) -> int:
+        try:
+            df = pd.read_csv(p, nrows=120)
+        except Exception:
+            return -999
+        cols = [c.lower() for c in df.columns.tolist()]
+        s = 0
+
+        # Prefer polish for this script
+        if any("polish" in c for c in cols):
+            s += 12
+        if any("finish" in c for c in cols):
+            s += 6
+
+        if any(k in c for c in cols for k in ["image", "img", "path", "file", "filename", "url"]):
+            s += 5
+
+        return s
+
+    scored = [(score_csv(p), p) for p in csvs]
+    scored.sort(reverse=True, key=lambda x: x[0])
+    best_score, best_path = scored[0]
+    return best_path if best_score >= 0 else csvs[0]
+
+
+# -----------------------------
+# Paths + image indexing
+# -----------------------------
+def is_image_file(fn: str) -> bool:
+    ext = os.path.splitext(fn)[1].lower()
+    return ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
+
+
+def build_image_index(root_dir: str) -> Dict[str, str]:
+    idx: Dict[str, str] = {}
+    for r, _, files in os.walk(root_dir):
+        for f in files:
+            if is_image_file(f):
+                base = os.path.basename(f)
+                if base not in idx:
+                    idx[base] = os.path.join(r, f)
+    return idx
+
+
+def resolve_image_path(val: str, root_dir: str, image_index: Dict[str, str]) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    if not s:
+        return None
+
+    if os.path.isabs(s) and os.path.isfile(s):
+        return s
+
+    p = os.path.join(root_dir, s.replace("/", os.sep))
+    if os.path.isfile(p):
+        return p
+
+    base = os.path.basename(s)
+    base = re.split(r"[?#]", base)[0]
+    if base in image_index:
+        return image_index[base]
+
+    return None
+
+
+# -----------------------------
+# Stratified split
+# -----------------------------
+def stratified_split_indices(labels: List[str], val_split: float, seed: int) -> Tuple[List[int], List[int]]:
+    rng = random.Random(seed)
+    by_class: Dict[str, List[int]] = {}
+    for i, y in enumerate(labels):
+        by_class.setdefault(y, []).append(i)
+
+    train_idx, val_idx = [], []
+    for y, idxs in by_class.items():
+        rng.shuffle(idxs)
+        n = len(idxs)
+        if n <= 1:
+            train_idx.extend(idxs)
+            continue
+        n_val = int(math.floor(n * val_split))
+        n_val = min(n_val, n - 1)
+        val_idx.extend(idxs[:n_val])
+        train_idx.extend(idxs[n_val:])
+
+    rng.shuffle(train_idx)
+    rng.shuffle(val_idx)
+    return train_idx, val_idx
+
+
+# -----------------------------
+# Dataset
+# -----------------------------
+class PolishDataset(Dataset):
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        img_col: str,
+        label_col: str,
+        root_dir: str,
+        label2idx: Dict[str, int],
+        image_index: Dict[str, str],
+        tfm=None,
+        max_decode_retries: int = 10,
+    ):
+        self.df = df.reset_index(drop=True)
+        self.img_col = img_col
+        self.label_col = label_col
+        self.root_dir = root_dir
+        self.label2idx = label2idx
+        self.image_index = image_index
+        self.tfm = tfm
+        self.max_decode_retries = max_decode_retries
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        last_err = None
+        for _ in range(self.max_decode_retries):
+            row = self.df.iloc[idx]
+            p = str(row[self.img_col])
+            y_str = str(row[self.label_col]).strip()
+
+            if y_str not in self.label2idx:
+                idx = torch.randint(0, len(self.df), (1,)).item()
+                continue
+
+            img_path = resolve_image_path(p, self.root_dir, self.image_index)
+            if img_path is None:
+                last_err = (p, "resolve_image_path=None")
+                idx = torch.randint(0, len(self.df), (1,)).item()
+                continue
+
+            try:
+                img = Image.open(img_path).convert("RGB")
+                if self.tfm is not None:
+                    img = self.tfm(img)
+                y = self.label2idx[y_str]
+                return img, y
+            except Exception as e:
+                last_err = (img_path, repr(e))
+                idx = torch.randint(0, len(self.df), (1,)).item()
+
+        raise RuntimeError(f"Decode failed. Last: {last_err[0]} | {last_err[1]}")
+
+
+# -----------------------------
+# Model (ConvNeXt-Tiny)
+# -----------------------------
+class PolishNet(nn.Module):
+    def __init__(self, num_classes: int, dropout: float = 0.1):
+        super().__init__()
+        weights = ConvNeXt_Tiny_Weights.DEFAULT
+        self.backbone = convnext_tiny(weights=weights)
+
+        in_features = self.backbone.classifier[2].in_features  # 768
+        self.backbone.classifier = nn.Sequential(
+            nn.Flatten(1),
+            nn.LayerNorm(in_features, eps=1e-6),
+            nn.Dropout(p=dropout),
+            nn.Linear(in_features, num_classes),
+        )
+
+    def forward(self, x):
+        return self.backbone(x)
+
+
+# -----------------------------
+# EMA
+# -----------------------------
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if p.requires_grad:
+                self.shadow[name] = p.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module):
+        d = self.decay
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(d).add_(p.detach(), alpha=(1.0 - d))
+
+    def apply_shadow(self, model: nn.Module):
+        self.backup = {}
+        for name, p in model.named_parameters():
+            if name in self.shadow:
+                self.backup[name] = p.detach().clone()
+                p.data.copy_(self.shadow[name].data)
+
+    def restore(self, model: nn.Module):
+        for name, p in model.named_parameters():
+            if name in self.backup:
+                p.data.copy_(self.backup[name].data)
+        self.backup = {}
+
+
+# -----------------------------
+# AMP helpers
+# -----------------------------
+def get_amp(device: torch.device):
+    if device.type != "cuda":
+        return None, None, False
+
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast") and hasattr(torch.amp, "GradScaler"):
+        try:
+            scaler = torch.amp.GradScaler("cuda", enabled=True)
+        except Exception:
+            scaler = torch.amp.GradScaler(enabled=True)
+        return torch.amp.autocast, scaler, True
+
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    return torch.cuda.amp.autocast, scaler, True
+
+
+class _NullCtx:
+    def __enter__(self): return None
+    def __exit__(self, exc_type, exc, tb): return False
+
+
+def autocast_context(autocast_fn, device: torch.device, enabled: bool):
+    if (not enabled) or (autocast_fn is None) or (device.type != "cuda"):
+        return _NullCtx()
+    try:
+        return autocast_fn("cuda", enabled=True)
+    except TypeError:
+        return autocast_fn(enabled=True)
+
+
+# -----------------------------
+# MixUp / CutMix
+# -----------------------------
+def one_hot(y: torch.Tensor, num_classes: int) -> torch.Tensor:
+    return F.one_hot(y, num_classes=num_classes).float()
+
+
+def rand_bbox(W: int, H: int, lam: float):
+    cut_rat = math.sqrt(1.0 - lam)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
+
+    cx = torch.randint(0, W, (1,)).item()
+    cy = torch.randint(0, H, (1,)).item()
+
+    x1 = max(cx - cut_w // 2, 0)
+    y1 = max(cy - cut_h // 2, 0)
+    x2 = min(cx + cut_w // 2, W)
+    y2 = min(cy + cut_h // 2, H)
+    return x1, y1, x2, y2
+
+
+def apply_mixup_cutmix(
+    x, y, num_classes: int,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    p_mix: float,
+):
+    y1 = one_hot(y, num_classes)
+
+    if p_mix <= 0 or torch.rand(1).item() > p_mix:
+        return x, y1, False
+
+    use_cutmix = (cutmix_alpha > 0) and (torch.rand(1).item() > 0.5)
+
+    if not use_cutmix:
+        if mixup_alpha <= 0:
+            return x, y1, False
+        lam = torch.distributions.Beta(mixup_alpha, mixup_alpha).sample().item()
+        perm = torch.randperm(x.size(0), device=x.device)
+        x2 = x[perm]
+        y2 = y1[perm]
+        x_aug = lam * x + (1 - lam) * x2
+        y_soft = lam * y1 + (1 - lam) * y2
+        return x_aug, y_soft, True
+
+    lam = torch.distributions.Beta(cutmix_alpha, cutmix_alpha).sample().item()
+    perm = torch.randperm(x.size(0), device=x.device)
+    x2 = x[perm]
+    y2 = y1[perm]
+
+    _, _, H, W = x.shape
+    x1b, y1b, x2b, y2b = rand_bbox(W, H, lam)
+
+    x_aug = x.clone()
+    x_aug[:, :, y1b:y2b, x1b:x2b] = x2[:, :, y1b:y2b, x1b:x2b]
+
+    area = (x2b - x1b) * (y2b - y1b)
+    lam_adj = 1.0 - (area / (W * H + 1e-12))
+    y_soft = lam_adj * y1 + (1 - lam_adj) * y2
+    return x_aug, y_soft, True
+
+
+def soft_cross_entropy(logits: torch.Tensor, y_soft: torch.Tensor) -> torch.Tensor:
+    logp = F.log_softmax(logits, dim=1)
+    return -(y_soft * logp).sum(dim=1).mean()
+
+
+# -----------------------------
+# Focal CE (for non-mix batches)
+# -----------------------------
+class FocalCrossEntropy(nn.Module):
+    def __init__(self, gamma: float = 1.0, weight: Optional[torch.Tensor] = None):
+        super().__init__()
+        self.gamma = float(gamma)
+        self.register_buffer("weight_buf", weight if weight is not None else None)
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        ce = F.cross_entropy(logits, target, weight=self.weight_buf, reduction="none")
+        pt = torch.exp(-ce).clamp(1e-8, 1.0)
+        loss = ((1.0 - pt) ** self.gamma) * ce
+        return loss.mean()
+
+
+# -----------------------------
+# Scheduler (warmup + cosine), per optimizer update
+# -----------------------------
+class WarmupCosine:
+    def __init__(self, optimizer: torch.optim.Optimizer, warmup_steps: int, total_steps: int):
+        self.optimizer = optimizer
+        self.warmup_steps = max(0, int(warmup_steps))
+        self.total_steps = max(1, int(total_steps))
+        self.base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self.step_num = 0
+
+    def _lr_mult(self, step: int) -> float:
+        if self.warmup_steps > 0 and step < self.warmup_steps:
+            return float(step) / float(self.warmup_steps)
+        if self.total_steps <= self.warmup_steps:
+            return 1.0
+        progress = (step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+        progress = min(max(progress, 0.0), 1.0)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    def set_lr(self, step: int):
+        m = self._lr_mult(step)
+        for base, pg in zip(self.base_lrs, self.optimizer.param_groups):
+            pg["lr"] = base * m
+
+    def step(self):
+        self.step_num += 1
+        self.set_lr(self.step_num)
+
+
+# -----------------------------
+# Transforms
+# -----------------------------
+def build_transforms(img_size: int, mean, std, train: bool, random_erasing_p: float = 0.0):
+    if train:
+        tfms = [
+            transforms.RandomResizedCrop(img_size, scale=(0.85, 1.0)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomRotation(7),
+            transforms.ColorJitter(brightness=0.05, contrast=0.05, saturation=0.03, hue=0.01),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+        if random_erasing_p > 0:
+            tfms.append(transforms.RandomErasing(p=float(random_erasing_p), scale=(0.02, 0.18), ratio=(0.3, 3.3), value="random"))
+        return transforms.Compose(tfms)
+    else:
+        return transforms.Compose([
+            transforms.Resize((img_size, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ])
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+@dataclass
+class Metrics:
+    loss: float
+    acc: float
+    bal_acc: float
+    macro_f1: float
+    macro_p: float
+    macro_r: float
+
+
+def metrics_from_confmat(conf: torch.Tensor) -> Tuple[float, float, float, float, float]:
+    conf_f = conf.float()
+    tp = torch.diag(conf_f)
+    support = conf_f.sum(dim=1)
+    total = support.sum().clamp_min(1.0)
+
+    acc = (tp.sum() / total).item()
+
+    recall = tp / (support.clamp_min(1e-12))
+    bal_acc = recall.mean().item()
+
+    fp = conf_f.sum(dim=0) - tp
+    precision = tp / (tp + fp + 1e-12)
+
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+
+    macro_f1 = f1.mean().item()
+    macro_p = precision.mean().item()
+    macro_r = recall.mean().item()
+    return acc, bal_acc, macro_f1, macro_p, macro_r
+
+
+def print_per_class(conf: torch.Tensor, classes: List[str], title: str):
+    conf = conf.detach().cpu().float()
+    tp = torch.diag(conf)
+    support = conf.sum(dim=1).clamp_min(1.0)
+    pred_sum = conf.sum(dim=0).clamp_min(1.0)
+
+    recall = (tp / support)
+    precision = (tp / pred_sum)
+    f1 = 2 * precision * recall / (precision + recall + 1e-12)
+
+    order = torch.argsort(support, descending=True)
+    print(title)
+    print(f"{'class':<12} {'n':>6} {'rec':>8} {'prec':>8} {'f1':>8}")
+    for i in order.tolist():
+        n_i = int(support[i].item())
+        print(f"{classes[i]:<12} {n_i:>6d} {recall[i].item()*100:>7.2f}% {precision[i].item()*100:>7.2f}% {f1[i].item():>8.4f}")
+
+
+def print_confusion_matrix(conf: torch.Tensor, classes: List[str], title: str = "[VAL] Confusion matrix"):
+    cm = conf.detach().cpu().to(torch.int64).numpy()
+    # header
+    print(title)
+    header = "true\\pred".ljust(10) + " ".join([c.rjust(8) for c in classes])
+    print(header)
+    for i, c in enumerate(classes):
+        row = [str(int(cm[i, j])).rjust(8) for j in range(len(classes))]
+        print(c.ljust(10) + " ".join(row))
+
+
+# -----------------------------
+# Imbalance helpers
+# -----------------------------
+def compute_class_counts(labels: List[int], num_classes: int) -> torch.Tensor:
+    counts = torch.zeros(num_classes, dtype=torch.float32)
+    for y in labels:
+        counts[y] += 1.0
+    return counts.clamp_min(1.0)
+
+
+def effective_num_weights(counts: torch.Tensor, beta: float = 0.9999) -> torch.Tensor:
+    beta = float(beta)
+    eff_num = 1.0 - torch.pow(torch.tensor(beta, dtype=torch.float32), counts)
+    w = (1.0 - beta) / eff_num.clamp_min(1e-12)
+    w = w / w.sum() * counts.numel()
+    return w
+
+
+def linear_tau_schedule(epoch: int, epochs: int, start: float, end: float, warmup_epochs: int) -> float:
+    if epoch <= warmup_epochs:
+        return float(start)
+    if epochs <= warmup_epochs:
+        return float(end)
+    t = (epoch - warmup_epochs) / float(max(1, epochs - warmup_epochs))
+    t = min(max(t, 0.0), 1.0)
+    return float(start + t * (end - start))
+
+
+# -----------------------------
+# Train / Eval (with tqdm bars)
+# -----------------------------
+def train_one_epoch(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    optimizer: torch.optim.Optimizer,
+    scheduler: WarmupCosine,
+    autocast_fn,
+    scaler,
+    use_amp: bool,
+    ema: Optional[ModelEMA],
+    num_classes: int,
+    label_smoothing: float,
+    mix_p: float,
+    mixup_alpha: float,
+    cutmix_alpha: float,
+    grad_clip: float,
+    accum_steps: int,
+    class_weights: Optional[torch.Tensor],
+    focal_gamma: float,
+):
+    model.train()
+    ce_hard = nn.CrossEntropyLoss(
+        label_smoothing=max(0.0, float(label_smoothing)),
+        weight=class_weights
+    )
+    focal = FocalCrossEntropy(gamma=float(focal_gamma), weight=class_weights) if focal_gamma > 0 else None
+
+    running = 0.0
+    n = 0
+
+    accum_steps = max(1, int(accum_steps))
+    optimizer.zero_grad(set_to_none=True)
+
+    pbar = tqdm(enumerate(loader, start=1), total=len(loader), desc="train", leave=False, dynamic_ncols=True)
+    micro = 0
+    updates = 0
+
+    for step, (x, y) in pbar:
+        micro += 1
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        if device.type == "cuda":
+            x = x.contiguous(memory_format=torch.channels_last)
+
+        x_aug, y_soft, did_mix = apply_mixup_cutmix(
+            x, y, num_classes=num_classes,
+            mixup_alpha=mixup_alpha, cutmix_alpha=cutmix_alpha, p_mix=mix_p
+        )
+
+        with autocast_context(autocast_fn, device, enabled=use_amp):
+            logits = model(x_aug)
+            if did_mix:
+                loss = soft_cross_entropy(logits, y_soft)
+            else:
+                if focal is not None:
+                    loss = focal(logits, y)
+                else:
+                    loss = ce_hard(logits, y)
+
+        running += loss.item() * x.size(0)
+        n += x.size(0)
+
+        if use_amp:
+            (scaler.scale(loss) / accum_steps).backward()
+        else:
+            (loss / accum_steps).backward()
+
+        do_step = (micro % accum_steps == 0) or (step == len(loader))
+        if do_step:
+            updates += 1
+            if use_amp:
+                if grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+
+            if ema is not None:
+                ema.update(model)
+
+        with torch.no_grad():
+            pred = logits.argmax(dim=1)
+            batch_acc = (pred == y).float().mean().item()
+
+        avg_loss = running / max(1, n)
+        lr_now = optimizer.param_groups[0]["lr"]
+        pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{batch_acc*100:.2f}%", lr=f"{lr_now:.2e}", upd=updates, accum=accum_steps)
+
+    return running / max(1, n)
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    num_classes: int,
+    desc: str = "val",
+    logit_adjust: Optional[torch.Tensor] = None,
+    tta: bool = False,
+) -> Tuple[Metrics, torch.Tensor]:
+    model.eval()
+    ce = nn.CrossEntropyLoss()
+
+    total_loss = 0.0
+    n = 0
+    conf = torch.zeros((num_classes, num_classes), device=device, dtype=torch.int64)
+
+    pbar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    for x, y in pbar:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        if device.type == "cuda":
+            x = x.contiguous(memory_format=torch.channels_last)
+
+        def forward_logits(inp):
+            lg = model(inp)
+            if logit_adjust is not None:
+                lg = lg + logit_adjust
+            return lg
+
+        logits = forward_logits(x)
+        if tta:
+            # simple TTA: horizontal flip
+            xf = torch.flip(x, dims=[3])
+            logits_f = forward_logits(xf)
+            logits = 0.5 * (logits + logits_f)
+
+        loss = ce(logits, y)
+
+        total_loss += loss.item() * x.size(0)
+        n += x.size(0)
+
+        pred = logits.argmax(dim=1)
+        idx = (y * num_classes + pred).to(torch.int64)
+        binc = torch.bincount(idx, minlength=num_classes * num_classes)
+        conf += binc.view(num_classes, num_classes)
+
+        acc, bal_acc, macro_f1, macro_p, macro_r = metrics_from_confmat(conf)
+        avg_loss = total_loss / max(1, n)
+        pbar.set_postfix(loss=f"{avg_loss:.4f}", acc=f"{acc*100:.2f}%", bal=f"{bal_acc*100:.2f}%")
+
+    avg_loss = total_loss / max(1, n)
+    acc, bal_acc, macro_f1, macro_p, macro_r = metrics_from_confmat(conf)
+    return Metrics(loss=avg_loss, acc=acc, bal_acc=bal_acc, macro_f1=macro_f1, macro_p=macro_p, macro_r=macro_r), conf
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+
+    ap.add_argument("--csv", default=None)
+    ap.add_argument("--root_dir", default=None)
+    ap.add_argument("--img_col", default=None)
+    ap.add_argument("--label_col", default=None)
+
+    ap.add_argument("--epochs", type=int, default=25)
+    ap.add_argument("--warmup_epochs", type=int, default=2)
+
+    ap.add_argument("--img_size", type=int, default=384)
+    ap.add_argument("--img_size_ft", type=int, default=512)
+    ap.add_argument("--ft_from_epoch", type=int, default=11)
+
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr_ft", type=float, default=8e-5)
+    ap.add_argument("--wd", type=float, default=1e-4)
+
+    ap.add_argument("--batch", type=int, default=16)
+    ap.add_argument("--effective_batch", type=int, default=64)
+    ap.add_argument("--accum_steps", type=int, default=None)
+
+    ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--val_split", type=float, default=0.15)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no_amp", action="store_true")
+
+    ap.add_argument("--out", default="polish_best.pt")
+    ap.add_argument("--num_workers", type=int, default=4)
+    ap.add_argument("--max_decode_retries", type=int, default=10)
+
+    ap.add_argument("--sampler", action="store_true", default=True)
+    ap.add_argument("--no_sampler", action="store_true")
+
+    ap.add_argument("--label_smoothing", type=float, default=0.05)
+
+    ap.add_argument("--mix_p", type=float, default=0.6)
+    ap.add_argument("--mixup_alpha", type=float, default=0.2)
+    ap.add_argument("--cutmix_alpha", type=float, default=0.5)
+
+    ap.add_argument("--ema", action="store_true", default=True)
+    ap.add_argument("--no_ema", action="store_true")
+    ap.add_argument("--ema_decay", type=float, default=0.999)
+    ap.add_argument("--grad_clip", type=float, default=1.0)
+
+    ap.add_argument("--per_class", action="store_true", default=True)
+    ap.add_argument("--no_per_class", action="store_true")
+
+    # imbalance + logit-adjust
+    ap.add_argument("--use_class_weights", action="store_true", default=True)
+    ap.add_argument("--no_class_weights", action="store_true")
+    ap.add_argument("--eff_beta", type=float, default=0.9999)
+
+    ap.add_argument("--tau_start", type=float, default=0.9)
+    ap.add_argument("--tau_end", type=float, default=0.4)
+    ap.add_argument("--tau_warmup", type=int, default=3)
+
+    ap.add_argument("--focal_gamma", type=float, default=1.0)
+
+    # head LR multiplier
+    ap.add_argument("--head_lr_mult", type=float, default=3.0)
+
+    # random erasing
+    ap.add_argument("--random_erasing", type=float, default=0.15)
+
+    # TTA at eval
+    ap.add_argument("--tta", action="store_true", default=False)
+
+    args = ap.parse_args()
+
+    if args.no_sampler:
+        args.sampler = False
+    if args.no_ema:
+        args.ema = False
+    if args.no_per_class:
+        args.per_class = False
+    if args.no_class_weights:
+        args.use_class_weights = False
+
+    if args.accum_steps is None:
+        args.accum_steps = max(1, int(math.ceil(args.effective_batch / max(1, args.batch))))
+
+    seed_all(args.seed)
+
+    # Auto-download
+    if args.csv is None:
+        ds_root = auto_download_diamond_dataset()
+        args.csv = find_best_csv(ds_root)
+        if args.root_dir is None:
+            args.root_dir = ds_root
+        print(f"[AUTO] Downloaded dataset root: {ds_root}")
+        print(f"[AUTO] Using CSV: {args.csv}")
+        print(f"[AUTO] Using root_dir: {args.root_dir}")
+
+    df = pd.read_csv(args.csv)
+    cols = df.columns.tolist()
+
+    img_col = args.img_col or guess_column(cols, ["image", "img", "path", "file", "filename", "url"])
+    label_col = args.label_col or guess_column(cols, ["polish", "finish"])
+
+    if img_col is None or label_col is None:
+        raise ValueError(f"לא הצלחתי לזהות עמודות. columns={cols}. תן --img_col ו--label_col ידנית.")
+
+    df = df.dropna(subset=[img_col, label_col]).copy()
+    df[label_col] = df[label_col].astype(str).str.strip()
+
+    # Classes
+    classes = sorted(df[label_col].unique().tolist())
+    label2idx = {c: i for i, c in enumerate(classes)}
+    idx2label = {i: c for c, i in label2idx.items()}
+    num_classes = len(classes)
+
+    print(f"[INFO] img_col={img_col} label_col={label_col} num_classes={num_classes}")
+    print(f"[INFO] classes={classes}")
+    print(f"[INFO] GradAccum: batch={args.batch} effective_batch={args.effective_batch} accum_steps={args.accum_steps}")
+
+    # Split
+    train_idx, val_idx = stratified_split_indices(df[label_col].tolist(), args.val_split, args.seed)
+    df_train = df.iloc[train_idx].copy()
+    df_val = df.iloc[val_idx].copy()
+
+    # Image index
+    image_index = build_image_index(args.root_dir)
+
+    # Transforms
+    weights = ConvNeXt_Tiny_Weights.DEFAULT
+    mean, std = weights.transforms().mean, weights.transforms().std
+
+    tfm_train = build_transforms(args.img_size, mean, std, train=True, random_erasing_p=args.random_erasing)
+    tfm_val = build_transforms(args.img_size, mean, std, train=False, random_erasing_p=0.0)
+    tfm_val_ft = build_transforms(args.img_size_ft, mean, std, train=False, random_erasing_p=0.0)
+
+    ds_train = PolishDataset(
+        df_train, img_col, label_col, args.root_dir, label2idx, image_index,
+        tfm=tfm_train, max_decode_retries=args.max_decode_retries
+    )
+    ds_val = PolishDataset(
+        df_val, img_col, label_col, args.root_dir, label2idx, image_index,
+        tfm=tfm_val, max_decode_retries=args.max_decode_retries
+    )
+
+    # Sampler
+    sampler = None
+    if args.sampler:
+        y_train_str = df_train[label_col].tolist()
+        counts: Dict[str, int] = {}
+        for y in y_train_str:
+            counts[y] = counts.get(y, 0) + 1
+        sample_weights = [1.0 / counts[y] for y in y_train_str]
+        sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+        print("[INFO] Sampler: WeightedRandomSampler ON")
+    else:
+        print("[INFO] Sampler: OFF")
+
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=args.batch,
+        shuffle=(sampler is None),
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    dl_val = DataLoader(
+        ds_val,
+        batch_size=args.batch,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=(args.num_workers > 0),
+    )
+
+    # Device + model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[INFO] Device: {device}")
+
+    model = PolishNet(num_classes=num_classes, dropout=args.dropout).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
+
+    # Split params: backbone vs head
+    head_params = []
+    backbone_params = []
+    for n, p in model.named_parameters():
+        if "backbone.classifier" in n:
+            head_params.append(p)
+        else:
+            backbone_params.append(p)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": backbone_params, "lr": args.lr},
+            {"params": head_params, "lr": args.lr * float(args.head_lr_mult)},
+        ],
+        weight_decay=args.wd
+    )
+
+    # AMP
+    autocast_fn, scaler, amp_available = get_amp(device)
+    use_amp = amp_available and (not args.no_amp)
+
+    # EMA
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+
+    # Scheduler
+    updates_per_epoch = int(math.ceil(len(dl_train) / max(1, args.accum_steps)))
+    warmup_steps = updates_per_epoch * max(0, int(args.warmup_epochs))
+    total_steps = updates_per_epoch * max(1, int(args.epochs))
+    sched = WarmupCosine(optimizer, warmup_steps=warmup_steps, total_steps=total_steps)
+    sched.set_lr(0)
+
+    # Class weights + priors
+    y_train_idx = [label2idx[str(v).strip()] for v in df_train[label_col].tolist() if str(v).strip() in label2idx]
+    counts_t = compute_class_counts(y_train_idx, num_classes=num_classes)
+    priors = (counts_t / counts_t.sum()).to(device)
+
+    class_weights = None
+    if args.use_class_weights:
+        cw = effective_num_weights(counts_t, beta=args.eff_beta)
+        cw = (cw / cw.sum() * num_classes).to(device)
+        class_weights = cw
+        print(f"[INFO] Class weights (effective-num, beta={args.eff_beta}): {cw.detach().cpu().tolist()}")
+    print(f"[INFO] Class priors: {priors.detach().cpu().tolist()}")
+    print(f"[INFO] Tau schedule: start={args.tau_start} end={args.tau_end} warmup={args.tau_warmup}")
+    print(f"[INFO] Focal gamma={args.focal_gamma} (applies only when no MixUp/CutMix in that batch)")
+    print(f"[INFO] head_lr_mult={args.head_lr_mult} | random_erasing={args.random_erasing} | TTA={args.tta}")
+
+    best_bal = -1.0
+
+    for epoch in range(1, args.epochs + 1):
+        # Fine-tune stage: bigger res + smaller LR
+        if epoch == args.ft_from_epoch:
+            print(f"[STAGE] Fine-tune from epoch {epoch}: img_size={args.img_size_ft}, lr_ft={args.lr_ft}")
+            ds_train.tfm = build_transforms(args.img_size_ft, mean, std, train=True, random_erasing_p=args.random_erasing)
+            ds_val.tfm = tfm_val_ft
+            for i, pg in enumerate(optimizer.param_groups):
+                base_lr = args.lr_ft
+                if i == 1:
+                    base_lr = args.lr_ft * float(args.head_lr_mult)
+                pg["lr"] = base_lr
+
+        tau = linear_tau_schedule(epoch, args.epochs, args.tau_start, args.tau_end, args.tau_warmup)
+        # logit adjustment vector
+        logit_adjust = (tau * torch.log(priors.clamp_min(1e-12))).to(device)
+
+        train_loss = train_one_epoch(
+            model=model,
+            loader=dl_train,
+            device=device,
+            optimizer=optimizer,
+            scheduler=sched,
+            autocast_fn=autocast_fn,
+            scaler=scaler,
+            use_amp=use_amp,
+            ema=ema,
+            num_classes=num_classes,
+            label_smoothing=args.label_smoothing,
+            mix_p=args.mix_p if epoch < args.ft_from_epoch else 0.0,
+            mixup_alpha=args.mixup_alpha if epoch < args.ft_from_epoch else 0.0,
+            cutmix_alpha=args.cutmix_alpha if epoch < args.ft_from_epoch else 0.0,
+            grad_clip=args.grad_clip,
+            accum_steps=args.accum_steps,
+            class_weights=class_weights,
+            focal_gamma=args.focal_gamma,
+        )
+
+        # Validate with EMA weights if enabled
+        if ema is not None:
+            ema.apply_shadow(model)
+
+        val_metrics, conf = evaluate(
+            model, dl_val, device, num_classes=num_classes, desc="val",
+            logit_adjust=logit_adjust,
+            tta=args.tta
+        )
+
+        if ema is not None:
+            ema.restore(model)
+
+        print(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"tau={tau:.2f} | "
+            f"train_loss={train_loss:.4f} | "
+            f"val_loss={val_metrics.loss:.4f} | "
+            f"val_acc={val_metrics.acc*100:.2f}% | "
+            f"val_bal_acc={val_metrics.bal_acc*100:.2f}% | "
+            f"val_macroF1={val_metrics.macro_f1:.4f} | "
+            f"val_macroP={val_metrics.macro_p*100:.2f}% | "
+            f"val_macroR={val_metrics.macro_r*100:.2f}%"
+        )
+
+        if args.per_class:
+            print_per_class(conf, classes, title=f"[VAL] Per-class @ epoch {epoch:02d}")
+            print_confusion_matrix(conf, classes, title=f"[VAL] Confusion matrix @ epoch {epoch:02d}")
+
+        if val_metrics.bal_acc > best_bal:
+            best_bal = val_metrics.bal_acc
+            ckpt = {
+                "model": model.state_dict(),
+                "ema": (ema.shadow if ema is not None else None),
+                "label2idx": label2idx,
+                "idx2label": idx2label,
+                "classes": classes,
+                "img_col": img_col,
+                "label_col": label_col,
+                "root_dir": args.root_dir,
+                "backbone": "convnext_tiny",
+                "weights": "ConvNeXt_Tiny_Weights.DEFAULT",
+                "task": "polish_classification",
+                "train": {
+                    "img_size": args.img_size,
+                    "img_size_ft": args.img_size_ft,
+                    "ft_from_epoch": args.ft_from_epoch,
+                    "epochs": args.epochs,
+                    "lr": args.lr,
+                    "lr_ft": args.lr_ft,
+                    "wd": args.wd,
+                    "batch": args.batch,
+                    "effective_batch": args.effective_batch,
+                    "accum_steps": args.accum_steps,
+                    "label_smoothing": args.label_smoothing,
+                    "mix": {"p": args.mix_p, "mixup_alpha": args.mixup_alpha, "cutmix_alpha": args.cutmix_alpha},
+                    "ema_decay": (args.ema_decay if args.ema else None),
+                    "class_weights": (class_weights.detach().cpu().tolist() if class_weights is not None else None),
+                    "priors": priors.detach().cpu().tolist(),
+                    "tau": {"start": args.tau_start, "end": args.tau_end, "warmup": args.tau_warmup},
+                    "focal_gamma": args.focal_gamma,
+                    "head_lr_mult": args.head_lr_mult,
+                    "random_erasing": args.random_erasing,
+                    "tta": args.tta,
+                }
+            }
+            torch.save(ckpt, args.out)
+            print(f"[SAVE] best -> {args.out} (val_bal_acc={best_bal*100:.2f}%)")
+
+    print(f"[DONE] best_val_bal_acc={best_bal*100:.2f}% | saved={args.out}")
+
+
+if __name__ == "__main__":
+    main()

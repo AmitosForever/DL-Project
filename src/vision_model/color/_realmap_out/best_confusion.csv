@@ -1,0 +1,8 @@
+,pred_Premium_White,pred_Near_Colorless_High,pred_Near_Colorless_Low,pred_Faint_Yellow,pred_Very_Light_Yellow,pred_Light_Yellow,pred_Yellow_LowEnd
+true_Premium_White,2975,692,96,6,1,24,10
+true_Near_Colorless_High,618,1378,749,55,3,26,16
+true_Near_Colorless_Low,47,288,1043,473,42,15,7
+true_Faint_Yellow,1,3,100,540,151,5,3
+true_Very_Light_Yellow,0,0,0,45,177,11,1
+true_Light_Yellow,0,0,0,0,27,12,3
+true_Yellow_LowEnd,0,0,0,0,5,8,28
