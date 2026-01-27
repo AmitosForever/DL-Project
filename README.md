@@ -8,16 +8,22 @@ A comprehensive machine learning pipeline that predicts diamond prices by combin
 
 ## 📋 Table of Contents
 
-- [Overview](#overview)
-- [Features](#features)
-- [Architecture](#architecture)
-- [Installation](#installation)
-- [Usage](#usage)
-- [Project Structure](#project-structure)
-- [Models](#models)
-- [Results](#results)
-- [Contributing](#contributing)
-- [License](#license)
+- [Overview](#-overview)
+- [Features](#-features)
+- [Architecture](#️-architecture)
+- [Installation](#-installation)
+- [Usage](#-usage)
+- [Project Structure](#-project-structure)
+- [Models](#-models)
+- [Results](#-results)
+- [Development](#️-development)
+- [Limitations and Known Issues](#️-limitations-and-known-issues)
+- [Future Work](#-future-work)
+- [Contributing](#-contributing)
+- [License](#-license)
+- [Authors](#-authors)
+- [Acknowledgments](#-acknowledgments)
+- [References](#-references)
 
 ## 🎯 Overview
 
@@ -174,6 +180,7 @@ python cut.py
 python polish.py
 python symmetry.py
 python shape.py
+```
 
 Models will be saved to `src/combined_models/vision_models/`
 
@@ -498,7 +505,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 👥 Authors
 
-- **Nadav Offir** 
+- **Nadav Offir**
 - **Amit Rubinshtein** - [GitHub](https://github.com/AmitosForever)
 
 *Deep Learning Course Project*
